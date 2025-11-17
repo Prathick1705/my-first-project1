@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bank Loan Default Prediction — Interactive Report</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { padding: 20px; background: #f7fafc; color: #0f172a; }
+    .card { box-shadow: 0 6px 18px rgba(2,6,23,0.06); border-radius: 12px; }
+    pre { background:#0b1220; color:#dbeafe; padding:12px; border-radius:8px; overflow:auto }
+    .small-muted { font-size:0.9rem; color:#64748b }
+    .metric { font-weight:700; font-size:1.1rem }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="d-flex align-items-center mb-4">
+      <div>
+        <h1 class="mb-0">Bank Loan Default Prediction</h1>
+        <div class="small-muted">Interactive HTML report: load the Kaggle CSV, explore, train a model (in-browser) and evaluate.</div>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="row g-3 mb-4">
+      <div class="col-md-6">
+        <div class="card p-3">
+          <label class="form-label">Upload CSV (Loan dataset)</label>
+          <input id="fileInput" class="form-control" type="file" accept=".csv" />
+          <div class="form-text">Supports standard Kaggle-style loan CSVs. Use the sample column selector below to map your target if needed.</div>
+        </div>
+      </div>
+      <div class="col-md-6">
+        <div class="card p-3">
+          <label class="form-label">Target column</label>
+          <input id="targetColumn" class="form-control" type="text" placeholder="e.g. Loan_Status or Default or target" />
+          <div class="form-text">Type the column name that indicates default (binary). If values are 'Y'/'N' or '1'/'0' they will be auto-detected.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- EDA and Preview -->
+    <div class="row g-3">
+      <div class="col-lg-6">
+        <div class="card p-3 mb-3">
+          <h5>Data preview</h5>
+          <div id="preview" style="max-height:260px; overflow:auto; font-size:0.9rem"></div>
+        </div>
+
+        <div class="card p-3 mb-3">
+          <h5>Summary statistics</h5>
+          <div id="summary" class="small-muted"></div>
+        </div>
+
+        <div class="card p-3">
+          <h5>Column types & mapping</h5>
+          <div id="colinfo" class="small-muted"></div>
+        </div>
+      </div>
+
+      <div class="col-lg-6">
+        <div class="card p-3 mb-3">
+          <h5>Charts</h5>
+          <canvas id="chart1" height="220"></canvas>
+        </div>
+
+        <div class="card p-3 mb-3">
+          <h5>Class balance</h5>
+          <canvas id="balanceChart" height="140"></canvas>
+        </div>
+
+        <div class="card p-3">
+          <h5>Model</h5>
+          <div class="d-flex gap-2 mb-2">
+            <button id="trainBtn" class="btn btn-primary">Train Logistic Model</button>
+            <button id="evalBtn" class="btn btn-outline-secondary">Evaluate on Test Split</button>
+            <button id="downloadBtn" class="btn btn-outline-success">Download Model (tfjs)</button>
+          </div>
+          <div id="modelStatus" class="small-muted">Model not trained.</div>
+          <div id="metrics" class="mt-2"></div>
+        </div>
+      </div>
+    </div>
+
+    <hr />
+    <p class="small-muted">Notes: This is a client-side demo using PapaParse, Chart.js and TensorFlow.js. For production use run training on server-side with cross-validation, hyperparameter search, feature engineering, handling class imbalance, and robust validation.</p>
+
+    <pre id="log">Ready.
+</pre>
+  </div>
+
+  <!-- Libraries -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.12.0/dist/tf.min.js"></script>
+
+  <script>
+    // Utility log
+    function addLog(s){ document.getElementById('log').textContent += '\n' + s; document.getElementById('log').scrollTop = 1e9 }
+
+    let rawRows = [];
+    let headers = [];
+    let X = null, y = null;
+    let model = null;
+    let mapping = {}; // col types
+
+    document.getElementById('fileInput').addEventListener('change', function(e){
+      const file = e.target.files[0];
+      if(!file) return;
+      Papa.parse(file, { header: true, skipEmptyLines: true,
+        complete: function(results){
+          rawRows = results.data;
+          headers = results.meta.fields;
+          document.getElementById('preview').innerHTML = renderPreview(rawRows, headers);
+          document.getElementById('colinfo').innerText = headers.join(', ');
+          inferTypes();
+          addLog('Loaded ' + rawRows.length + ' rows and ' + headers.length + ' columns');
+          drawBalance();
+        }
+      })
+    })
+
+    function renderPreview(rows, headers, n=6){
+      if(!rows || rows.length===0) return '<i>No data</i>';
+      let out = '<table class="table table-sm"><thead><tr>' + headers.map(h=>'<th>'+h+'</th>').join('') + '</tr></thead><tbody>';
+      for(let i=0;i<Math.min(n,rows.length);i++){
+        out += '<tr>' + headers.map(h=>'<td>'+escapeHtml(rows[i][h] ?? '')+'</td>').join('') + '</tr>';
+      }
+      out += '</tbody></table>';
+      return out;
+    }
+    function escapeHtml(s){ return (''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
+
+    function inferTypes(){
+      mapping = {};
+      if(rawRows.length===0) return;
+      headers.forEach(h=>{
+        let numeric = true;
+        for(let r of rawRows){
+          const v = r[h];
+          if(v===null || v===undefined || v==='') continue;
+          if(isNaN(parseFloat(String(v).replace(/,/g,'')))){ numeric=false; break }
+        }
+        mapping[h] = numeric ? 'numeric' : 'categorical';
+      })
+      let summary = Object.entries(mapping).map(([k,v])=>k+': '+v).join('\n');
+      document.getElementById('summary').innerText = summary;
+    }
+
+    function drawBalance(){
+      const tgt = document.getElementById('targetColumn').value || guessTarget();
+      if(!tgt || !headers.includes(tgt)) return;
+      const counts = {};
+      for(let r of rawRows){ let v = r[tgt]; if(v==='' || v===undefined) v='(missing)'; counts[v]=(counts[v]||0)+1 }
+      const labels = Object.keys(counts); const data = labels.map(l=>counts[l]);
+      const ctx = document.getElementById('balanceChart').getContext('2d');
+      if(window._balanceChart) window._balanceChart.destroy();
+      window._balanceChart = new Chart(ctx, { type:'pie', data:{ labels, datasets:[{ data }] }, options:{ responsive:true } });
+    }
+
+    function guessTarget(){
+      // common target names
+      const candidates = ['Loan_Status','Default','loan_status','default','Target','target'];
+      for(let c of candidates) if(headers.includes(c)) return c;
+      return headers[headers.length-1];
+    }
+
+    // Prepare features & labels
+    function prepareData(){
+      const tgt = document.getElementById('targetColumn').value || guessTarget();
+      if(!tgt) throw new Error('No target column');
+      // Build X and y matrices
+      const rows = rawRows.filter(r=> r[tgt] !== undefined && r[tgt] !== '');
+      // Determine feature columns (all except target)
+      const featCols = headers.filter(h=>h!==tgt);
+      // Build categorical maps
+      const catMaps = {};
+      featCols.forEach(c=>{ if(mapping[c]==='categorical') catMaps[c] = {} })
+
+      // first pass to collect categories
+      for(let r of rows){
+        for(let c of Object.keys(catMaps)){
+          const v = r[c] === undefined || r[c]==='' ? '(missing)' : String(r[c]);
+          if(!(v in catMaps[c])) catMaps[c][v] = Object.keys(catMaps[c]).length;
+        }
+      }
+
+      const Xarr = []; const yarr = [];
+      for(let r of rows){
+        const rowArr = [];
+        for(let c of featCols){
+          if(mapping[c]==='numeric'){
+            let v = r[c]; if(v===''||v===undefined) v = NaN; v = parseFloat(String(v).replace(/,/g,'')); rowArr.push(isNaN(v)?0:v);
+          } else {
+            const v = r[c]===''||r[c]===undefined ? '(missing)' : String(r[c]);
+            const map = catMaps[c];
+            // one-hot expansion
+            const onehot = new Array(Object.keys(map).length).fill(0);
+            const idx = map[v] ?? null;
+            if(idx!==null && idx!==undefined) onehot[idx]=1;
+            rowArr.push(...onehot);
+          }
+        }
+        // label
+        let lab = rows.indexOf(r) >= 0 ? r[tgt] : r[tgt];
+        lab = normalizeLabel(lab);
+        if(lab===null) continue; // skip if label can't be parsed
+        Xarr.push(rowArr); yarr.push(lab);
+      }
+
+      // Basic scaling: column-wise mean/std
+      const Xmat = tf.tensor2d(Xarr);
+      const {mean, variance} = tf.moments(Xmat, 0);
+      const std = tf.sqrt(variance).add(1e-6);
+      const Xnorm = Xmat.sub(mean).div(std);
+
+      X = Xnorm;
+      y = tf.tensor2d(yarr, [yarr.length, 1]);
+      addLog('Prepared tensors: X=' + X.shape + ', y=' + y.shape);
+      return {X, y};
+
+      function normalizeLabel(v){
+        if(v===undefined || v==='' || v===null) return null;
+        const s = String(v).trim().toLowerCase();
+        if(['1','yes','y','true','t','default','d'].includes(s)) return 1;
+        if(['0','no','n','false','f','notdefault','no_default','paid'].includes(s)) return 0;
+        // try numeric
+        const n = parseFloat(s); if(!isNaN(n)) return n>0?1:0;
+        return null;
+      }
+    }
+
+    document.getElementById('trainBtn').addEventListener('click', async function(){
+      try{
+        addLog('Starting training...');
+        const prepared = prepareData();
+        const split = Math.floor(prepared.X.shape[0] * 0.8);
+        const Xtrain = prepared.X.slice([0,0],[split, -1]);
+        const ytrain = prepared.y.slice([0,0],[split, -1]);
+        const Xval = prepared.X.slice([split,0],[prepared.X.shape[0]-split, -1]);
+        const yval = prepared.y.slice([split,0],[prepared.y.shape[0]-split, -1]);
+
+        // simple logistic regression (single dense sigmoid)
+        model = tf.sequential();
+        model.add(tf.layers.dense({units:1, inputShape:[prepared.X.shape[1]], activation:'sigmoid'}));
+        model.compile({ optimizer: tf.train.adam(0.01), loss:'binaryCrossentropy', metrics:['accuracy'] });
+
+        document.getElementById('modelStatus').innerText = 'Training...';
+        await model.fit(Xtrain, ytrain, { epochs: 30, validationData:[Xval,yval], batchSize:32, callbacks:{
+          onEpochEnd: (epoch,logs)=>{ document.getElementById('modelStatus').innerText = 'Epoch ' + (epoch+1) + ' val_loss=' + logs.val_loss.toFixed(4); }
+        }});
+
+        document.getElementById('modelStatus').innerText = 'Trained.';
+        addLog('Training complete');
+        document.getElementById('metrics').innerHTML = '<div class="metric">Trained model: 1-layer logistic</div>';
+
+      }catch(err){ addLog('Train error: ' + err); alert(err) }
+    })
+
+    document.getElementById('evalBtn').addEventListener('click', async function(){
+      try{
+        if(!model) return alert('Model not trained');
+        // re-prepare to ensure X,y in scope
+        const prepared = prepareData();
+        const n = prepared.X.shape[0]; const split = Math.floor(n*0.8);
+        const Xtest = prepared.X.slice([split,0],[n-split, -1]);
+        const ytest = prepared.y.slice([split,0],[n-split, -1]);
+        const preds = model.predict(Xtest);
+        const predArr = await preds.array();
+        const yArr = await ytest.array();
+        // compute metrics
+        let tp=0,tn=0,fp=0,fn=0;
+        for(let i=0;i<yArr.length;i++){
+          const p = predArr[i][0] >= 0.5 ? 1 : 0;
+          const t = yArr[i][0] >= 0.5 ? 1 : 0;
+          if(p===1 && t===1) tp++;
+          if(p===1 && t===0) fp++;
+          if(p===0 && t===1) fn++;
+          if(p===0 && t===0) tn++;
+        }
+        const accuracy = (tp+tn)/(tp+tn+fp+fn);
+        const precision = tp/(tp+fp||1);
+        const recall = tp/(tp+fn||1);
+        const f1 = 2*precision*recall/(precision+recall||1);
+        document.getElementById('metrics').innerHTML = `
+          <div>Accuracy: <strong>${(accuracy*100).toFixed(2)}%</strong></div>
+          <div>Precision: <strong>${(precision*100).toFixed(2)}%</strong></div>
+          <div>Recall: <strong>${(recall*100).toFixed(2)}%</strong></div>
+          <div>F1: <strong>${(f1*100).toFixed(2)}%</strong></div>
+          <div class="mt-2">Confusion matrix: TP=${tp}, FP=${fp}, FN=${fn}, TN=${tn}</div>
+        `;
+        addLog('Evaluation done.');
+      }catch(err){ addLog('Eval error: '+err); alert(err) }
+    })
+
+    document.getElementById('downloadBtn').addEventListener('click', async function(){
+      if(!model) return alert('Train model first');
+      await model.save('downloads://loan_default_model');
+    })
+
+    // Small demo chart (first numeric col distribution)
+    function drawDemoChart(){
+      if(!headers || headers.length===0) return;
+      const numeric = headers.find(h => mapping[h] === 'numeric');
+      if(!numeric) return;
+      const vals = rawRows.map(r => parseFloat((r[numeric]||'').toString().replace(/,/g,''))).filter(v=>!isNaN(v));
+      if(vals.length===0) return;
+      const bins = 20; const min = Math.min(...vals); const max = Math.max(...vals);
+      const step = (max-min)/bins; const counts = new Array(bins).fill(0);
+      vals.forEach(v=>{ const idx = Math.min(bins-1, Math.floor((v-min)/step||0)); counts[idx]++ });
+      const labels = counts.map((c,i)=> (min + i*step).toFixed(0));
+      const ctx = document.getElementById('chart1').getContext('2d');
+      if(window._chart1) window._chart1.destroy();
+      window._chart1 = new Chart(ctx, { type:'bar', data:{ labels, datasets:[{ label:numeric, data:counts }] }, options:{ responsive:true } });
+    }
+
+    // Re-draw charts when target column input changes
+    document.getElementById('targetColumn').addEventListener('change', function(){ drawBalance(); })
+
+    // whenever preview is updated we call demo chart
+    const previewObserver = new MutationObserver(()=>{ drawDemoChart(); });
+    previewObserver.observe(document.getElementById('preview'), { childList:true, subtree:true });
+  </script>
+</body>
+</html>
